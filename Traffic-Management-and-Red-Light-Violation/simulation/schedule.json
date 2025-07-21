@@ -1,0 +1,70 @@
+[
+  {
+    "current": "ID-4",
+    "recommended": "ID-1",
+    "duration_sec": 28,
+    "all_counts": {
+      "ID-1": 13,
+      "ID-2": 4,
+      "ID-3": 3,
+      "ID-4": 3
+    },
+    "all_states": {
+      "ID-1": "yellow",
+      "ID-2": "red",
+      "ID-3": "red",
+      "ID-4": "red"
+    }
+  },
+  {
+    "current": "ID-1",
+    "recommended": "ID-4",
+    "duration_sec": 10,
+    "all_counts": {
+      "ID-1": 11,
+      "ID-2": 2,
+      "ID-3": 2,
+      "ID-4": 4
+    },
+    "all_states": {
+      "ID-1": "red",
+      "ID-2": "red",
+      "ID-3": "red",
+      "ID-4": "yellow"
+    }
+  },
+  {
+    "current": "ID-3",
+    "recommended": "ID-3",
+    "duration_sec": 12,
+    "all_counts": {
+      "ID-1": 5,
+      "ID-2": 4,
+      "ID-3": 5,
+      "ID-4": 4
+    },
+    "all_states": {
+      "ID-1": "green",
+      "ID-2": "red",
+      "ID-3": "yellow",
+      "ID-4": "red"
+    }
+  },
+  {
+    "current": "ID-2",
+    "recommended": "ID-2",
+    "duration_sec": 8,
+    "all_counts": {
+      "ID-1": 9,
+      "ID-2": 3,
+      "ID-3": 3,
+      "ID-4": 7
+    },
+    "all_states": {
+      "ID-1": "red",
+      "ID-2": "yellow",
+      "ID-3": "red",
+      "ID-4": "red"
+    }
+  }
+]

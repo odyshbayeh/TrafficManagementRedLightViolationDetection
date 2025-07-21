@@ -1,0 +1,399 @@
+import cv2
+import math
+import numpy as np
+
+# ======================================================
+# 1. STATIC DEFINITIONS ("WORLD" SETTINGS)
+# ------------------------------------------------------
+# Fixed traffic light panel positions (these remain static on the screen)
+traffic_lights_positions = {
+    "ID-1": (35, 150),
+    "ID-2": (105, 150),
+    "ID-3": (175, 150),
+    "ID-4": (245, 150)
+}
+
+# Offsets for traffic light state cycles (in frames)
+offsets = {
+    "ID-1": 0,
+    "ID-2": 200,
+    "ID-3": 450,
+    "ID-4": 700
+}
+T_period = 950
+
+# Pre-defined "world" intersection polygons.
+# These coordinates are defined in the reference (world) frame.
+world_intersections = {
+    "ID-1": np.array([[524, 335],
+                      [528, 346],
+                      [827, 221],
+                      [834, 238]], dtype=np.float32),
+    "ID-2": np.array([[524, 335],
+                      [528, 346],
+                      [827, 221],
+                      [834, 238]], dtype=np.float32),
+    "ID-3": np.array([[524, 335],
+                      [528, 346],
+                      [827, 221],
+                      [834, 238]], dtype=np.float32),
+    "ID-4": np.array([[524, 335],
+                      [528, 346],
+                      [827, 221],
+                      [834, 238]], dtype=np.float32)
+}
+
+# ------------------------------------------------------
+# Unique colors for each intersection (BGR format)
+intersection_colors = {
+    "ID-1": (255, 0, 0),  # Blue
+    "ID-2": (0, 255, 0),  # Green
+    "ID-3": (0, 0, 255),  # Red
+    "ID-4": (255, 255, 0)  # Cyan
+}
+
+# ======================================================
+# 2. COLOR DEFINITIONS & HELPER FUNCTIONS
+# ------------------------------------------------------
+base_green = (0, 255, 0)
+dark_green = (0, 100, 0)
+base_yellow = (0, 255, 255)
+dark_yellow = (0, 150, 150)
+base_red = (0, 0, 255)
+dark_red = (0, 0, 100)
+
+
+def lerp_color(c1, c2, t):
+    """Linearly interpolate between colors c1 and c2 (t in [0,1])."""
+    return (int(c1[0] * (1 - t) + c2[0] * t),
+            int(c1[1] * (1 - t) + c2[1] * t),
+            int(c1[2] * (1 - t) + c2[2] * t))
+
+
+def get_panel_colors(light_id, frame_count):
+    """Compute dynamic colors for a traffic light panel based on frame_count."""
+    offset = offsets[light_id]
+    if frame_count < offset:
+        return (base_red, dark_yellow, dark_green)
+    r = (frame_count - offset) % T_period
+
+    # Red circle:
+    if r < 50:
+        red_color = dark_red
+    elif r < 200:
+        red_color = dark_red
+    elif r < 250:
+        red_color = lerp_color(dark_red, base_red, (r - 200) / 50.0)
+    else:
+        red_color = base_red
+
+    # Yellow circle:
+    if r < 50:
+        norm = r / 50.0
+        factor = (1 - math.cos(2 * math.pi * norm)) / 2
+        yellow_color = lerp_color(dark_yellow, base_yellow, factor)
+    elif r < 200:
+        yellow_color = dark_yellow
+    elif r < 250:
+        norm = (r - 200) / 50.0
+        factor = (1 - math.cos(2 * math.pi * norm)) / 2
+        yellow_color = lerp_color(dark_yellow, base_yellow, factor)
+    else:
+        yellow_color = dark_yellow
+
+    # Green circle:
+    if r < 50:
+        green_color = dark_green
+    elif r < 200:
+        norm = (r - 50) / 150.0
+        if norm > 0.8:
+            t_internal = (norm - 0.8) / 0.2
+            green_color = lerp_color(base_green, dark_green, t_internal)
+        else:
+            green_color = base_green
+    else:
+        green_color = dark_green
+
+    return red_color, yellow_color, green_color
+
+
+# Panel drawing parameters.
+panel_width = 20
+panel_height = 90  # tall enough for three stacked circles
+circle_radius = 8
+
+
+def get_circle_centers(panel_center):
+    """Compute centers for the red (top), yellow (middle), and green (bottom) circles."""
+    cx, cy = panel_center
+    red_center = (cx, int(cy - panel_height / 3))
+    yellow_center = (cx, cy)
+    green_center = (cx, int(cy + panel_height / 3))
+    return red_center, yellow_center, green_center
+
+
+def transform_points(points, H):
+    """Apply homography H to an array of points (Nx2) and return integer coordinates."""
+    pts = points.reshape(-1, 1, 2)
+    pts_trans = cv2.perspectiveTransform(pts, H)
+    return pts_trans.reshape(-1, 2).astype(np.int32)
+
+
+# ======================================================
+# 3. ANNOTATION ON THE REFERENCE FRAME
+# ------------------------------------------------------
+# Global variables for intersection annotation.
+current_annotation_id = None  # e.g., "ID-1", "ID-2", etc.
+annotations = {"ID-1": [], "ID-2": [], "ID-3": [], "ID-4": []}
+intersection_homographies = {}  # stores computed homographies for intersections
+
+# Global variables for mask annotation.
+current_mask_mode = False  # When True, mask annotation mode is active.
+current_mask_annotation = []  # Collects points for the current mask region.
+mask_polygons = []  # List of finalized mask polygons.
+
+# Global variables for crossing-line annotation.
+current_crossing_mode = False  # When True, crossing-line annotation mode is active.
+current_crossing_annotation = []  # Collects points for the current crossing line.
+current_crossing_id = None  # The intersection ID for which we're annotating the crossing line.
+crossing_lines = {}  # Dictionary mapping intersection ID to the crossing-line points.
+
+
+def mouse_callback_ref(event, x, y, flags, param):
+    """Mouse callback to capture clicks on the reference frame.
+       Handles intersection, mask, and crossing-line annotations."""
+    global current_annotation_id, current_mask_mode, current_mask_annotation
+    global current_crossing_mode, current_crossing_annotation, current_crossing_id
+    if event == cv2.EVENT_LBUTTONDOWN:
+        if current_annotation_id is not None:
+            annotations[current_annotation_id].append((x, y))
+            print(
+                f"Intersection {current_annotation_id}: Point ({x},{y}) added ({len(annotations[current_annotation_id])}/4).")
+            if len(annotations[current_annotation_id]) == 4:
+                src = world_intersections[current_annotation_id]
+                dst = np.array(annotations[current_annotation_id], dtype=np.float32)
+                H, _ = cv2.findHomography(src, dst, cv2.RANSAC)
+                intersection_homographies[current_annotation_id] = H
+                print(f"Computed homography for {current_annotation_id}:\n{H}")
+                current_annotation_id = None
+        elif current_mask_mode:
+            current_mask_annotation.append((x, y))
+            print(f"Mask annotation: Point ({x},{y}) added. Total points: {len(current_mask_annotation)}.")
+        elif current_crossing_mode:
+            current_crossing_annotation.append((x, y))
+            print(
+                f"Crossing-line annotation for {current_crossing_id}: Point ({x},{y}) added. Total points: {len(current_crossing_annotation)}.")
+
+
+# ------------------------------------------------------
+# 3a. Select a Reference Frame
+video_path = r"C:\Users\odysh\OneDrive\Desktop\test\videos\1minute.mp4"
+cap = cv2.VideoCapture(video_path)
+if not cap.isOpened():
+    raise Exception("Error opening video source")
+
+select_window = "Select Reference Frame"
+cv2.namedWindow(select_window)
+
+ref_frame = None
+while True:
+    ret, frame = cap.read()
+    if not ret:
+        raise Exception("Error reading video for reference frame selection.")
+    cv2.putText(frame, "Press 'c' to capture this frame for annotation, 'q' to quit.",
+                (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+    cv2.imshow(select_window, frame)
+    key = cv2.waitKey(30) & 0xFF
+    if key == ord('c'):
+        ref_frame = frame.copy()
+        print("Reference frame captured for annotation.")
+        break
+    elif key == ord('q'):
+        cap.release()
+        cv2.destroyAllWindows()
+        exit()
+
+cv2.destroyWindow(select_window)
+
+# ------------------------------------------------------
+# 3b. Annotate Intersections, Masks, and Crossing Lines on the Reference Frame
+cv2.namedWindow("Reference Frame")
+cv2.setMouseCallback("Reference Frame", mouse_callback_ref)
+
+print("Reference frame ready for annotation.")
+print("Press keys 1-4 to annotate an intersection (click 4 points).")
+print("Press 'x' to enter mask annotation mode; click points and press 'p' to save the mask.")
+print("Press 'v' to enter crossing-line annotation mode; then press 1-4 to choose the intersection,")
+print("click crossing-line points (at least 2), and press 'd' to save the crossing line.")
+print("Press 's' when done annotating to start main video playback.")
+
+while True:
+    temp = ref_frame.copy()
+    # Draw intersection polygons.
+    for id_key, H_ann in intersection_homographies.items():
+        poly = transform_points(world_intersections[id_key], H_ann)
+        cv2.polylines(temp, [poly], isClosed=True, color=(0, 0, 255), thickness=1)
+    # Draw saved mask polygons.
+    for poly in mask_polygons:
+        cv2.polylines(temp, [poly.astype(np.int32)], isClosed=True, color=(0, 0, 0), thickness=1)
+    # Draw current mask annotation.
+    if current_mask_mode and len(current_mask_annotation) > 0:
+        pts = np.array(current_mask_annotation, dtype=np.int32)
+        cv2.polylines(temp, [pts], isClosed=False, color=(0, 0, 0), thickness=1)
+    # Draw saved crossing lines.
+    for id_key, cross_line in crossing_lines.items():
+        cv2.polylines(temp, [cross_line.astype(np.int32)], isClosed=False, color=(0, 255, 255), thickness=1)
+    # Draw current crossing-line annotation.
+    if current_crossing_mode and len(current_crossing_annotation) > 0:
+        pts = np.array(current_crossing_annotation, dtype=np.int32)
+        cv2.polylines(temp, [pts], isClosed=False, color=(0, 255, 255), thickness=1)
+    cv2.imshow("Reference Frame", temp)
+    key = cv2.waitKey(0) & 0xFF
+    if key == ord('s'):
+        break
+    elif key in [ord('1'), ord('2'), ord('3'), ord('4')]:
+        current_annotation_id = "ID-" + chr(key)
+        annotations[current_annotation_id] = []
+        print(f"Intersection annotation mode activated for {current_annotation_id}. Click 4 points.")
+        print(f"ID-1 from the triangle to the street\nID-2 from the street to the triangle\nID-3 from the street to the triangle\nID-4 from the street to the triangle")
+    elif key == ord('x'):
+        current_mask_mode = True
+        current_mask_annotation = []
+        print("Mask annotation mode activated. Click points then press 'p' to save this mask.")
+    elif key == ord('p'):
+        if current_mask_mode and len(current_mask_annotation) >= 3:
+            mask_polygons.append(np.array(current_mask_annotation, dtype=np.float32))
+            print("Mask polygon saved.")
+            current_mask_mode = False
+            current_mask_annotation = []
+        else:
+            print("Not enough points for a mask polygon (need at least 3).")
+    elif key == ord('v'):
+        print("Enter intersection ID for crossing-line annotation (press 1-4):")
+        key2 = cv2.waitKey(0) & 0xFF
+        if key2 in [ord('1'), ord('2'), ord('3'), ord('4')]:
+            current_crossing_id = "ID-" + chr(key2)
+            if current_crossing_id not in intersection_homographies:
+                print(f"No intersection annotation exists for {current_crossing_id}. Annotate it first.")
+                current_crossing_id = None
+            else:
+                current_crossing_mode = True
+                current_crossing_annotation = []
+                print(
+                    f"Crossing-line annotation mode activated for {current_crossing_id}. Click points then press 'd' to save the crossing line.")
+    elif key == ord('d'):
+        if current_crossing_mode and len(current_crossing_annotation) >= 2:
+            crossing_lines[current_crossing_id] = np.array(current_crossing_annotation, dtype=np.float32)
+            print(f"Crossing line for {current_crossing_id} saved.")
+            current_crossing_mode = False
+            current_crossing_annotation = []
+            current_crossing_id = None
+        else:
+            print("Not enough points for a crossing line (need at least 2).")
+cv2.destroyWindow("Reference Frame")
+
+# IMPORTANT: Reset video capture so that playback starts from the beginning.
+cap.release()
+cap = cv2.VideoCapture(video_path)
+
+
+# ======================================================
+# 4. MAIN LOOP: DYNAMIC HOMOGRAPHY, OVERLAYS, MASKING, AND CROSSING LINES
+# ------------------------------------------------------
+def compute_dynamic_homography(ref_img, cur_img):
+    """Compute homography from ref_img to cur_img using ORB feature matching."""
+    ref_gray = cv2.cvtColor(ref_img, cv2.COLOR_BGR2GRAY)
+    cur_gray = cv2.cvtColor(cur_img, cv2.COLOR_BGR2GRAY)
+    orb = cv2.ORB_create(1000)
+    kp1, des1 = orb.detectAndCompute(ref_gray, None)
+    kp2, des2 = orb.detectAndCompute(cur_gray, None)
+    if des1 is None or des2 is None:
+        return None
+    bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
+    matches = bf.match(des1, des2)
+    if len(matches) < 10:
+        return None
+    matches = sorted(matches, key=lambda m: m.distance)
+    src_pts = np.float32([kp1[m.queryIdx].pt for m in matches]).reshape(-1, 1, 2)
+    dst_pts = np.float32([kp2[m.trainIdx].pt for m in matches]).reshape(-1, 1, 2)
+    H, _ = cv2.findHomography(src_pts, dst_pts, cv2.RANSAC, 5.0)
+    return H
+
+frame_count = 0
+crossing_offset = 5  # Specify the number of pixels to offset the crossing line.
+
+while True:
+    ret, frame = cap.read()
+    if not ret:
+        break
+    frame_count += 1
+
+    # Compute dynamic homography from the reference frame to the current frame.
+    H_dynamic = compute_dynamic_homography(ref_frame, frame)
+
+    # Draw static traffic light panels.
+    for light_id, panel_center in traffic_lights_positions.items():
+        red_col, yellow_col, green_col = get_panel_colors(light_id, frame_count)
+        cx, cy = panel_center
+        top_left = (int(cx - panel_width / 2), int(cy - panel_height / 2))
+        bottom_right = (int(cx + panel_width / 2), int(cy + panel_height / 2))
+        cv2.rectangle(frame, top_left, bottom_right, (255, 255, 255), thickness=-1)
+        red_center, yellow_center, green_center = get_circle_centers(panel_center)
+        cv2.circle(frame, red_center, circle_radius, red_col, thickness=-1)
+        cv2.circle(frame, yellow_center, circle_radius, yellow_col, thickness=-1)
+        cv2.circle(frame, green_center, circle_radius, green_col, thickness=-1)
+        cv2.putText(frame, light_id, (bottom_right[0] + 5, cy),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+
+    # Draw dynamic intersection overlays.
+    if H_dynamic is not None:
+        for id_key, H_ann in intersection_homographies.items():
+            color = intersection_colors.get(id_key, (255, 0, 0))
+            H_total = H_dynamic.dot(H_ann)  # Composite homography
+            poly = transform_points(world_intersections[id_key], H_total)
+            cv2.polylines(frame, [poly], isClosed=True, color=color, thickness=1)
+            cv2.putText(frame, f"{id_key}", (poly[0][0], poly[0][1] - 10),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
+
+            # Define and draw the crossing line.
+            if len(poly) >= 2:
+                pt1 = poly[0]  # First point of the intersection
+                pt2 = poly[1]  # Second point of the intersection
+                # Compute the direction vector
+                direction = pt2 - pt1
+                direction = direction / np.linalg.norm(direction)  # Normalize the vector
+                # Compute the perpendicular direction vector
+                perp_direction = np.array([-direction[1], direction[0]])
+                if id_key in ["ID-2"]:
+                    perp_direction = -perp_direction  # Invert direction for ID-2
+                if id_key in ["ID-3"]:
+                    perp_direction = -perp_direction  # Invert direction for ID-2
+                if id_key in ["ID-4"]:
+                    perp_direction = -perp_direction  # Invert direction for ID-2
+                perp_direction = perp_direction / np.linalg.norm(perp_direction)  # Normalize the vector
+                # Offset the crossing line by the specified number of pixels in the perpendicular direction
+                crossing_pt1 = pt1 + crossing_offset * perp_direction
+                crossing_pt2 = pt2 + crossing_offset * perp_direction
+
+                # Determine the traffic light state for this intersection.
+                r_val = (frame_count - offsets[id_key]) % T_period
+                line_color = base_green if 50 <= r_val < 200 else base_red
+
+                # Draw the crossing line.
+                cv2.line(frame, tuple(crossing_pt1.astype(int)), tuple(crossing_pt2.astype(int)), line_color, thickness=1)
+
+    # Apply mask overlays.
+    if H_dynamic is not None and len(mask_polygons) > 0:
+        for mask_poly in mask_polygons:
+            trans_mask = transform_points(mask_poly, H_dynamic)
+            cv2.fillPoly(frame, [trans_mask], (0, 0, 0))
+
+    cv2.putText(frame, f"Frame: {frame_count}", (20, 60),
+                cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
+    cv2.imshow("Dynamic Intersection Overlays", frame)
+    key = cv2.waitKey(30) & 0xFF
+    if key == ord('q'):
+        break
+
+cap.release()
+cv2.destroyAllWindows()
